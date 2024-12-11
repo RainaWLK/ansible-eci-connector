@@ -8,6 +8,14 @@ DOCUMENTATION = '''
       - Must have boto3 and cryptography
     author: mpieters3
     options:
+      platform:
+          default: aws
+          description: Cloud provider. Support AWS and Alicloud
+          ini:
+            - section: defaults
+              key: eci_platform
+          vars:
+            - name: eci_platform
       aws_access_key:
           description: AWS access key. If not set then the value of the AWS_ACCESS_KEY_ID, AWS_ACCESS_KEY or EC2_ACCESS_KEY environment variable is used.
           ini:
@@ -58,6 +66,7 @@ DOCUMENTATION = '''
             - name: ansible_region
             - name: aws_region
             - name: ec2_region
+            - name: eci_region
       instance_id:
           description: ec2-instance-id to connect to, will be looked up if not provided
           ini:
@@ -425,6 +434,7 @@ import tempfile
 from datetime import datetime
 import socket
 import ipaddress
+import subprocess
 
 from ansible.module_utils.basic import missing_required_lib
 from ansible.errors import AnsibleConnectionFailure, AnsibleError
@@ -435,6 +445,13 @@ try:
 except ImportError:
     HAS_BOTO = False
     
+try:
+    from aliyunsdkcore.client import AcsClient
+    from aliyunsdkecs.request.v20140526 import DescribeInstancesRequest
+    HAS_ALICLOUD_SDK = True
+except ImportError:
+    HAS_ALICLOUD_SDK = False
+
 try:
     from cryptography.hazmat.backends import default_backend
     from cryptography.hazmat.primitives.serialization.ssh import load_ssh_private_key
@@ -465,6 +482,7 @@ ECI_CACHE_INSTANCE_ID = "instance_id"
 ECI_CACHE_AZ = "availability_zone"
 ECI_CACHE_PROFILE = "profile"
 ECI_CACHE_ROLE_ARN = "role_arn"
+ECI_CACHE_PLATFORM = "platform"
 
 ECI_CONNECTION_CACHE = {}
 
@@ -511,7 +529,11 @@ class Connection(ssh.Connection):
       connection_metadata = self._get_eci_data()
       if (datetime.now().timestamp() - connection_metadata[ECI_CACHE_LAST_PUSH]) > ECI_PUSH_EXPIRY:
         display.vv("ECI PUB KEY EXPIRING/NOT SENT, PUSHING NOW %s-%s" % (connection_metadata[ECI_CACHE_REMOTE_USER], connection_metadata[ECI_CACHE_INSTANCE_ID]))
-        self._push_key(connection_metadata)
+        
+        if connection_metadata[ECI_CACHE_PLATFORM] == "alicloud":
+          self._push_key_to_alicloud_ecs(connection_metadata)
+        else:
+          self._push_key_to_aws_ec2(connection_metadata)
         self._cache_eci_data(connection_metadata)
 
     def _cache_eci_data(self, connection_metadata):
@@ -523,8 +545,6 @@ class Connection(ssh.Connection):
         json.dump(connection_metadata, outfile)
 
     def _get_eci_data(self):
-      session = self._init_session()
-
       if hasattr(self, '_eci_data'):
         display.vvv("LOCAL ECI DATA EXISTS")
         return self._eci_data
@@ -548,37 +568,43 @@ class Connection(ssh.Connection):
         display.vv("NO PRIVATE KEY FILE, GENERATING ON DEMAND")
         private_key_file, private_key = self._create_temporary_key()
 
-        public_key = private_key.public_key().public_bytes(
-          encoding=serialization.Encoding.OpenSSH,
-          format=serialization.PublicFormat.OpenSSH
-        ).decode('utf-8')
+      public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.OpenSSH,
+        format=serialization.PublicFormat.OpenSSH
+      ).decode('utf-8')
         
-        cache_entry = {
-          ECI_CACHE_KEY_FILE: private_key_file,
-          ECI_CACHE_PUBLIC_KEY: public_key,
-          ECI_CACHE_LAST_PUSH: 0,
-          ECI_CACHE_REMOTE_USER: self._play_context.remote_user,
-        }
+      cache_entry = {
+        ECI_CACHE_KEY_FILE: private_key_file,
+        ECI_CACHE_PUBLIC_KEY: public_key,
+        ECI_CACHE_LAST_PUSH: 0,
+        ECI_CACHE_REMOTE_USER: self._play_context.remote_user,
+        ECI_CACHE_PLATFORM: "aws"
+      }
 
       lookup_address = self._play_context.remote_addr
       try:
         ip = ipaddress.ip_address(lookup_address)
       except ValueError:
         lookup_address = socket.gethostbyname(lookup_address)
+
+      if self.get_option('platform'):
+        cache_entry[ECI_CACHE_PLATFORM] = self.get_option('platform')
+      
+      platform = cache_entry[ECI_CACHE_PLATFORM]
       if self.get_option('instance_id'):
-        cache_entry[ECI_CACHE_INSTANCE_ID] = self.get_option('instance_id')
+        instance_id = self.get_option('instance_id')
       else:
-        client = session.client('ec2')
-        display.vv("NO INSTANCE_ID PROVIDED, ATTEMPTING LOOKUP for %s" % lookup_address)
-        for filter_name in ('ip-address', 'private-ip-address', 'private-dns-name'):
-          filter = [{'Name': filter_name,'Values': [lookup_address ]}]
-          response = client.describe_instances(Filters=filter)
-          for r in response['Reservations']:
-            for i in r['Instances']:
-              cache_entry[ECI_CACHE_INSTANCE_ID] = i['InstanceId']
-          ##We've found it, so stop
-          if(ECI_CACHE_INSTANCE_ID in cache_entry):
-            break
+        if platform == "alicloud":
+          region = self.get_option('region')
+          instance_info = self._get_instance_id_from_alicloud(region, lookup_address)
+          instance_id = instance_info["InstanceId"]
+          instance_location = instance_info["RegionId"]
+        else:
+          instance_info = self._get_instance_id_from_aws(lookup_address)
+          instance_id = instance_info['InstanceId']
+          instance_location = instance_info['Placement']['AvailabilityZone']
+
+      cache_entry[ECI_CACHE_INSTANCE_ID] = instance_id
 
       if not ECI_CACHE_INSTANCE_ID in cache_entry:
         raise Exception('No instance_id found for %s' % lookup_address)
@@ -586,18 +612,49 @@ class Connection(ssh.Connection):
       if self.get_option('availability_zone'):
         cache_entry[ECI_CACHE_AZ] = self.get_option('availability_zone')
       else:
-        display.vv("NO AVAILABILITY_ZONE PROVIDED, ATTEMPTING LOOKUP for %s" % lookup_address)
-        client = session.client('ec2')
-        response = client.describe_instances(InstanceIds=[cache_entry[ECI_CACHE_INSTANCE_ID]])
-        for r in response['Reservations']:
-          for i in r['Instances']:
-            cache_entry[ECI_CACHE_AZ] = i['Placement']['AvailabilityZone']
-          ##We've found it, so stop
-          if ECI_CACHE_AZ in cache_entry:
-            break
+        cache_entry[ECI_CACHE_AZ] = instance_location
+
       self._cache_eci_data(cache_entry)
 
       return cache_entry
+
+    def _get_instance_id_from_aws(self, public_ip):
+      instance_info = None
+
+      session = self._init_session()
+      client = session.client('ec2')
+      display.vv("NO INSTANCE_ID PROVIDED, ATTEMPTING LOOKUP for %s" % public_ip)
+      for filter_name in ('ip-address', 'private-ip-address', 'private-dns-name'):
+        filter = [{'Name': filter_name,'Values': [public_ip ]}]
+        response = client.describe_instances(Filters=filter)
+        for r in response['Reservations']:
+          for i in r['Instances']:
+            instance_info = i
+            break
+
+      return instance_info
+
+    def _get_instance_id_from_alicloud(self, region, public_ip):
+      client = AcsClient(
+        os.environ.get("ALICLOUD_ACCESS_KEY_ID"),
+        os.environ.get("ALICLOUD_ACCESS_KEY_SECRET"),
+        region_id=region
+      )
+
+      # Initialize a request and set parameters
+      request = DescribeInstancesRequest.DescribeInstancesRequest()
+      request.set_PublicIpAddresses([public_ip])
+
+      response = client.do_action_with_exception(request)
+      resJson = json.loads(response)
+      if len(resJson['Instances']['Instance']) == 0:
+        return None
+      
+      instance = resJson['Instances']['Instance'][0]
+      print("instance=")
+      print(instance)
+      return instance
+
 
     def _create_temporary_key(self):
       key = rsa.generate_private_key(
@@ -650,7 +707,7 @@ class Connection(ssh.Connection):
 
       return self.session
 
-    def _push_key(self, connection_metadata):
+    def _push_key_to_aws_ec2(self, connection_metadata):
       session = self._init_session()
       client = session.client('ec2-instance-connect')
       client.send_ssh_public_key(
@@ -659,4 +716,14 @@ class Connection(ssh.Connection):
           SSHPublicKey=connection_metadata[ECI_CACHE_PUBLIC_KEY],
           AvailabilityZone=connection_metadata[ECI_CACHE_AZ],
       )
+      connection_metadata[ECI_CACHE_LAST_PUSH] = datetime.now().timestamp()
+
+    def _push_key_to_alicloud_ecs(self, connection_metadata):
+      send_key_cmd = f'ali-instance-cli send_public_key\
+                --region {connection_metadata[ECI_CACHE_AZ]} \
+                --instance {connection_metadata[ECI_CACHE_INSTANCE_ID]} \
+                --public-key "{connection_metadata[ECI_CACHE_PUBLIC_KEY]}" \
+                --user-name {connection_metadata[ECI_CACHE_REMOTE_USER]}'
+
+      subprocess.run(send_key_cmd, shell=True, check=True)
       connection_metadata[ECI_CACHE_LAST_PUSH] = datetime.now().timestamp()
