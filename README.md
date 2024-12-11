@@ -50,6 +50,33 @@ env ANSIBLE_CONNECTION_PLUGINS=../plugins/connection ansible-playbook -vv demo.y
 ## Why not MSSH? 
 While <a href="https://github.com/mingbowan/mssh/blob/master/mssh.py">mssh</a> may be an option as well, it was important to ensure better support for everything the original SSH provider has
 
+## (Optional) Support Alicloud
+> x86 machine only because Ali-instance-cli cannot run at Arm env.
+
+To support alicloud session manager (Like AWS ECI), do the following steps:
+
+- install Alicloud SDK
+```
+pip3 install --upgrade setuptools wheel twine check-wheel-contents packaging==22
+pip3 install aliyun-python-sdk-core aliyun-python-sdk-ecs
+```
+- install Alicloud Instance Cli tool [official doc](https://www.alibabacloud.com/help/en/ecs/user-guide/register-a-public-key-and-connect-to-an-instance-with-the-key-by-using-ali-instance-cli)
+```
+curl -O https://aliyun-client-assist.oss-accelerate.aliyuncs.com/session-manager/linux/ali-instance-cli
+chmod a+x ali-instance-cli
+mv ali-instance-cli /usr/local/bin
+```
+- Setup Credentials in environment variable
+  - ALIBABA_CLOUD_ACCESS_KEY_ID
+  - ALIBABA_CLOUD_ACCESS_KEY_SECRET
+
+- Create Ansible Inventory file
+```
+[Machines]
+mytest ansible_host=<ip address> ansible_connection=eci eci_platform=alicloud eci_region=cn-hongkong
+```
+
+
 ## TODO
 - IP Address to instance id (or vice versa?) lookup
 - remove temp keys when run finishes

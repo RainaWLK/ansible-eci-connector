@@ -55,7 +55,7 @@ DOCUMENTATION = '''
             - name: role_arn
             - name: aws_role_arn
       region:
-          description: The AWS region to use. If not specified then the value of the AWS_REGION or EC2_REGION environment variable, if any, is used. See http://docs.aws.amazon.com/general/latest/gr/rande.html#ec2_region
+          description: The Region to use.May be some cloud provider. If not specified then the value of the AWS_REGION or EC2_REGION environment variable, if any, is used. See http://docs.aws.amazon.com/general/latest/gr/rande.html#ec2_region
           ini:
             - section: defaults
               key: region
@@ -502,6 +502,7 @@ class Connection(ssh.Connection):
         self._load_name = self.__module__.split('.')[-1]
         self._ansible_playbook_pid = kwargs.get('ansible_playbook_pid')
         self.session = None
+        self.alicloud_session = None
 
         self.set_options()
 
@@ -595,8 +596,7 @@ class Connection(ssh.Connection):
         instance_id = self.get_option('instance_id')
       else:
         if platform == "alicloud":
-          region = self.get_option('region')
-          instance_info = self._get_instance_id_from_alicloud(region, lookup_address)
+          instance_info = self._get_instance_id_from_alicloud(lookup_address)
           instance_id = instance_info["InstanceId"]
           instance_location = instance_info["RegionId"]
         else:
@@ -634,12 +634,8 @@ class Connection(ssh.Connection):
 
       return instance_info
 
-    def _get_instance_id_from_alicloud(self, region, public_ip):
-      client = AcsClient(
-        os.environ.get("ALICLOUD_ACCESS_KEY_ID"),
-        os.environ.get("ALICLOUD_ACCESS_KEY_SECRET"),
-        region_id=region
-      )
+    def _get_instance_id_from_alicloud(self, public_ip):
+      client = self._init_session_alicloud()
 
       # Initialize a request and set parameters
       request = DescribeInstancesRequest.DescribeInstancesRequest()
@@ -651,8 +647,6 @@ class Connection(ssh.Connection):
         return None
       
       instance = resJson['Instances']['Instance'][0]
-      print("instance=")
-      print(instance)
       return instance
 
 
@@ -706,6 +700,30 @@ class Connection(ssh.Connection):
           )
 
       return self.session
+
+    # TODO: support sts, role arn
+    def _init_session_alicloud(self):
+      if self.alicloud_session == None:
+        access_key = None
+        secret = None
+        # Chaos env definition from alicloud
+        if os.environ.get("ALICLOUD_ACCESS_KEY_ID") != None:
+          access_key = os.environ.get("ALICLOUD_ACCESS_KEY_ID")
+          secret = os.environ.get("ALICLOUD_ACCESS_KEY_SECRET")
+        elif os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID") != None:
+          access_key = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID")
+          secret = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+        elif os.environ.get("ALIYUN_ACCESS_KEY_ID") != None:
+          access_key = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID")
+          secret = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+
+        self.alicloud_session = AcsClient(
+          access_key,
+          secret,
+          region_id=self.get_option('region')
+        )
+
+      return self.alicloud_session
 
     def _push_key_to_aws_ec2(self, connection_metadata):
       session = self._init_session()
