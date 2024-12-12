@@ -35,7 +35,7 @@ DOCUMENTATION = '''
           vars:
             - name: aws_secret_key
       profile:
-          description: The name of a AWS profile to use. If not given, then the default profile is used.
+          description: The name of a CSP profile to use. If not given, then the default profile is used.
           ini:
             - section: defaults
               key: profile
@@ -44,8 +44,9 @@ DOCUMENTATION = '''
           vars:
             - name: profile
             - name: aws_profile
+            - name: eci_profile
       role_arn:
-          description: AWS role arn for STS assume-role.
+          description: CSP role arn for STS assume-role.
           ini:
             - section: defaults
               key: role_arn
@@ -54,6 +55,7 @@ DOCUMENTATION = '''
           vars:
             - name: role_arn
             - name: aws_role_arn
+            - name: eci_role_arn
       region:
           description: The Region to use.May be some cloud provider. If not specified then the value of the AWS_REGION or EC2_REGION environment variable, if any, is used. See http://docs.aws.amazon.com/general/latest/gr/rande.html#ec2_region
           ini:
@@ -74,14 +76,7 @@ DOCUMENTATION = '''
               key: instance_id
           vars:
             - name: ansible_instance_id
-      availability_zone:
-          description: availability zone for the ec2 instance, will be looked up if not provided
-          ini:
-            - section: defaults
-              key: availability_zone
-          vars:
-            - name: ansible_availability_zone
-          version_added: 2.12.0
+            - name: eci_instance_id
       disable_caching:
           description: Disables caching of eci key/push metadata between requests
           default: False
@@ -432,6 +427,7 @@ import json
 import os
 import tempfile
 from datetime import datetime
+from pathlib import Path
 import socket
 import ipaddress
 import subprocess
@@ -479,10 +475,10 @@ ECI_CACHE_LAST_PUSH = "last_push"
 ECI_CACHE_PUBLIC_KEY = "public_key"
 ECI_CACHE_REMOTE_USER = "remote_user"
 ECI_CACHE_INSTANCE_ID = "instance_id"
-ECI_CACHE_AZ = "availability_zone"
 ECI_CACHE_PROFILE = "profile"
 ECI_CACHE_ROLE_ARN = "role_arn"
 ECI_CACHE_PLATFORM = "platform"
+ECI_CACHE_REGION = "region"
 
 ECI_CONNECTION_CACHE = {}
 
@@ -590,35 +586,36 @@ class Connection(ssh.Connection):
 
       if self.get_option('platform'):
         cache_entry[ECI_CACHE_PLATFORM] = self.get_option('platform')
-      
       platform = cache_entry[ECI_CACHE_PLATFORM]
-      if self.get_option('instance_id'):
-        instance_id = self.get_option('instance_id')
+
+      region = self.get_option('region')
+      instance_id = self.get_option('instance_id')
+      if platform == "alicloud":
+        instance_info = None
+        if not instance_id:
+          instance_info = self._get_instance_from_alicloud(ip_address=lookup_address)
+          if instance_info:
+            instance_id = instance_info["InstanceId"]
+            if not region:
+              region = instance_info["RegionId"]
       else:
-        if platform == "alicloud":
-          instance_info = self._get_instance_id_from_alicloud(lookup_address)
-          instance_id = instance_info["InstanceId"]
-          instance_location = instance_info["RegionId"]
-        else:
-          instance_info = self._get_instance_id_from_aws(lookup_address)
-          instance_id = instance_info['InstanceId']
-          instance_location = instance_info['Placement']['AvailabilityZone']
+        if not instance_id:
+          instance_info = self._get_instance_from_aws(lookup_address)
+          if instance_info:
+            instance_id = instance_info['InstanceId']
+            region = instance_info["Region"]
 
-      cache_entry[ECI_CACHE_INSTANCE_ID] = instance_id
-
-      if not ECI_CACHE_INSTANCE_ID in cache_entry:
+      if not instance_id:
         raise Exception('No instance_id found for %s' % lookup_address)
-      
-      if self.get_option('availability_zone'):
-        cache_entry[ECI_CACHE_AZ] = self.get_option('availability_zone')
-      else:
-        cache_entry[ECI_CACHE_AZ] = instance_location
+
+      cache_entry[ECI_CACHE_REGION] = region
+      cache_entry[ECI_CACHE_INSTANCE_ID] = instance_id
 
       self._cache_eci_data(cache_entry)
 
       return cache_entry
 
-    def _get_instance_id_from_aws(self, public_ip):
+    def _get_instance_from_aws(self, public_ip):
       instance_info = None
 
       session = self._init_session()
@@ -634,21 +631,45 @@ class Connection(ssh.Connection):
 
       return instance_info
 
-    def _get_instance_id_from_alicloud(self, public_ip):
+    def _get_instance_from_alicloud(self, ip_address=None, instance_id=None):
       client = self._init_session_alicloud()
 
-      # Initialize a request and set parameters
-      request = DescribeInstancesRequest.DescribeInstancesRequest()
-      request.set_PublicIpAddresses([public_ip])
+      def _send_request(request):
+        response = client.do_action_with_exception(request)
+        resJson = json.loads(response)
+        if len(resJson['Instances']['Instance']) == 0:
+          return None
+        
+        result = resJson['Instances']['Instance'][0]
+        return result
 
-      response = client.do_action_with_exception(request)
-      resJson = json.loads(response)
-      if len(resJson['Instances']['Instance']) == 0:
-        return None
-      
-      instance = resJson['Instances']['Instance'][0]
-      return instance
+      if instance_id:
+        request = DescribeInstancesRequest.DescribeInstancesRequest()
+        request.set_InstanceIds([instance_id])
+        instance_info = _send_request(request)
+        if instance_info != None:
+          return instance_info
+      elif ip_address:
+        # Query each parameter to find target
+        request = DescribeInstancesRequest.DescribeInstancesRequest()
+        request.set_EipAddresses([ip_address])
+        instance_info = _send_request(request)
+        if instance_info != None:
+          return instance_info
 
+        request = DescribeInstancesRequest.DescribeInstancesRequest()
+        request.set_PublicIpAddresses([ip_address])
+        instance_info = _send_request(request)
+        if instance_info != None:
+          return instance_info
+
+        request = DescribeInstancesRequest.DescribeInstancesRequest()
+        request.set_PrivateIpAddresses([ip_address])
+        instance_info = _send_request(request)
+        if instance_info != None:
+          return instance_info
+
+      return None
 
     def _create_temporary_key(self):
       key = rsa.generate_private_key(
@@ -701,26 +722,43 @@ class Connection(ssh.Connection):
 
       return self.session
 
+    
+    def _read_alicloud_profile(self, profile_name=None):
+      if profile_name == None:
+        profile_name = "default"
+      with open(f'{Path.home()}/.aliyun/config.json') as f:
+        d = json.load(f)
+        if isinstance(d.get("profiles"), list) :
+          for profile in d["profiles"]:
+            if profile.get("name") == profile_name:
+              return profile
+      return {}
+
     # TODO: support sts, role arn
     def _init_session_alicloud(self):
       if self.alicloud_session == None:
-        access_key = None
-        secret = None
-        # Chaos env definition from alicloud
+        access_key=None
+        secret=None
+        region = None
+        # Only support ALICLOUD_ACCESS_KEY_ID because ali-instance-cli.
+        # Noted using ALIBABA_CLOUD_ACCESS_KEY_ID from official document cannot work
         if os.environ.get("ALICLOUD_ACCESS_KEY_ID") != None:
           access_key = os.environ.get("ALICLOUD_ACCESS_KEY_ID")
           secret = os.environ.get("ALICLOUD_ACCESS_KEY_SECRET")
-        elif os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID") != None:
-          access_key = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID")
-          secret = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
-        elif os.environ.get("ALIYUN_ACCESS_KEY_ID") != None:
-          access_key = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_ID")
-          secret = os.environ.get("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+        else:
+          profile = self._read_alicloud_profile(self.get_option('profile'))
+          if profile.get("mode") == "AK":
+            access_key = profile.get("access_key_id")
+            secret = profile.get("access_key_secret")
+            region = profile.get("region_id")
+
+        if self.get_option('region'):
+          region = self.get_option('region')
 
         self.alicloud_session = AcsClient(
           access_key,
           secret,
-          region_id=self.get_option('region')
+          region_id=region
         )
 
       return self.alicloud_session
@@ -731,14 +769,17 @@ class Connection(ssh.Connection):
       client.send_ssh_public_key(
           InstanceId=connection_metadata[ECI_CACHE_INSTANCE_ID], 
           InstanceOSUser=connection_metadata[ECI_CACHE_REMOTE_USER],
-          SSHPublicKey=connection_metadata[ECI_CACHE_PUBLIC_KEY],
-          AvailabilityZone=connection_metadata[ECI_CACHE_AZ],
+          SSHPublicKey=connection_metadata[ECI_CACHE_PUBLIC_KEY]
       )
       connection_metadata[ECI_CACHE_LAST_PUSH] = datetime.now().timestamp()
 
     def _push_key_to_alicloud_ecs(self, connection_metadata):
+      region = connection_metadata[ECI_CACHE_REGION]
+      if not region:
+        session = self._init_session_alicloud()
+        region = session._region_id
       send_key_cmd = f'ali-instance-cli send_public_key\
-                --region {connection_metadata[ECI_CACHE_AZ]} \
+                --region {region} \
                 --instance {connection_metadata[ECI_CACHE_INSTANCE_ID]} \
                 --public-key "{connection_metadata[ECI_CACHE_PUBLIC_KEY]}" \
                 --user-name {connection_metadata[ECI_CACHE_REMOTE_USER]}'

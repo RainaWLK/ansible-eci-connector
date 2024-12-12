@@ -38,6 +38,22 @@ ansible-galaxy collection install amazon.aws
 Make sure the plugin is being pulled in correctly... from the workspace directory, run the following command to make sure you're getting the connection info:
 env ANSIBLE_CONNECTION_PLUGINS=./plugins/connection ansible-doc -t connection eci
 
+### Inventory Example
+```
+[Machines]
+mytest1 ansible_host=<ip address> aws_region=ap-northeast-1 ansible_connection=eci
+
+# use aws profile. Instance should be placed in same region with aws profile
+mytest2 ansible_host=<ip address> profile=dev ansible_connection=eci
+
+# assign instance id directly, will run faster
+mytest1 ansible_host=<ip address> aws_region=ap-northeast-1 profile=dev ansible_connection=eci eci_instance_id=i-1234567890
+
+# Other cloud provider
+mytest2 ansible_host=<ip address> ansible_connection=eci eci_platform=alicloud eci_region=cn-hongkong
+mytest2 ansible_host=<ip address> ansible_connection=eci eci_platform=alicloud eci_region=cn-hongkong eci_instance_id=i-abc1234567890
+```
+
 ### Running playbook
 Continuing in your venv, set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for the account the test should run in, then run the test
 ```
@@ -66,16 +82,11 @@ curl -O https://aliyun-client-assist.oss-accelerate.aliyuncs.com/session-manager
 chmod a+x ali-instance-cli
 mv ali-instance-cli /usr/local/bin
 ```
-- Setup Credentials in environment variable
-  - ALIBABA_CLOUD_ACCESS_KEY_ID
-  - ALIBABA_CLOUD_ACCESS_KEY_SECRET
-
-- Create Ansible Inventory file
-```
-[Machines]
-mytest ansible_host=<ip address> ansible_connection=eci eci_platform=alicloud eci_region=cn-hongkong
-```
-
+- Setup Credentials
+  - use environment variable
+    - ALICLOUD_ACCESS_KEY_ID
+    - ALICLOUD_ACCESS_KEY_ID
+  - Prepared alicloud profile
 
 ## TODO
 - IP Address to instance id (or vice versa?) lookup
