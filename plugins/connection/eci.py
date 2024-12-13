@@ -598,17 +598,16 @@ class Connection(ssh.Connection):
             instance_id = instance_info["InstanceId"]
             if not region:
               region = instance_info["RegionId"]
+        cache_entry[ECI_CACHE_REGION] = region
       else:
         if not instance_id:
           instance_info = self._get_instance_from_aws(lookup_address)
           if instance_info:
             instance_id = instance_info['InstanceId']
-            region = instance_info["Region"]
 
       if not instance_id:
         raise Exception('No instance_id found for %s' % lookup_address)
 
-      cache_entry[ECI_CACHE_REGION] = region
       cache_entry[ECI_CACHE_INSTANCE_ID] = instance_id
 
       self._cache_eci_data(cache_entry)
